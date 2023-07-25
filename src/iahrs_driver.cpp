@@ -6,6 +6,7 @@
 #include <tf/transform_datatypes.h>
 #include <geometry_msgs/TransformStamped.h>
 #include <geometry_msgs/Quaternion.h>
+#include <geometry_msgs/PoseStamped.h>
 
 //Service_include...
 #include "iahrs_driver/all_data_reset.h"
@@ -29,8 +30,9 @@
 #include <dirent.h>
 #include <signal.h>
 
-#define SERIAL_PORT		"/dev/IMU"
+#define SERIAL_PORT		"/dev/imu-iahrs"
 #define SERIAL_SPEED		B115200
+#define LOOP_HZ 		400
 
 typedef struct IMU_DATA
 {
@@ -59,6 +61,7 @@ double time_offset_in_seconds;
 double dSend_Data[10];
 double m_dRoll, m_dPitch, m_dYaw;
 sensor_msgs::Imu imu_data_msg;
+geometry_msgs::PoseStamped pose_data_msg;
 //tf_prefix add
 std::string tf_prefix_;
 //single_used TF
@@ -126,7 +129,10 @@ int SendRecv(const char* command, double* returned_data, int data_length)
 	int command_len = strlen(command);
 	int n = write(serial_fd, command, command_len);
 
-	if (n < 0) return -1;
+	if (n < 0){
+		std::cout << "Write fail" << std::endl;
+		return -1;
+	}
 
 	const int buff_size = 1024;
 	int  recv_len = 0;
@@ -142,7 +148,7 @@ int SendRecv(const char* command, double* returned_data, int data_length)
 		}
 		else if (n == 0) 
 		{
-			usleep(1000);
+			usleep(100); // 1000
 		}
 		else if (n > 0) 
 		{
@@ -306,6 +312,7 @@ int main (int argc, char** argv)
 
     	ros::NodeHandle nh;
 	ros::Publisher imu_data_pub = nh.advertise<sensor_msgs::Imu>("imu/data", 1);
+	ros::Publisher pose_pub = nh.advertise<geometry_msgs::PoseStamped>("pose/data",1);
 	
 	//IMU Service///////////////////////////////////////////////////////////////////////////////////////////////
     	ros::NodeHandle sh;
@@ -318,16 +325,22 @@ int main (int argc, char** argv)
 	nh.getParam("m_bSingle_TF_option", m_bSingle_TF_option);
     	printf("##m_bSingle_TF_option: %d \n", m_bSingle_TF_option);
 
-    	ros::Rate loop_rate(100); //HZ
+    	ros::Rate loop_rate(400); //HZ, default: 100
     	serial_open();
 
+	SendRecv("sp=5\n", dSend_Data, 10);	// data sync rate 5 ms (200 Hz)
+	usleep(10000);
+	SendRecv("fw\n", dSend_Data, 10);	// fw
+	usleep(10000);
 	SendRecv("za\n", dSend_Data, 10);	// Euler Angle -> '0.0' Reset
 	usleep(10000);
 
+	ros::Time rosTime = ros::Time::now();
     while(ros::ok())
     {
         ros::spinOnce();
-
+		// std::cout << "ros time diff: " << (ros::Time::now() - rosTime).toSec() << std::endl;
+		// rosTime = ros::Time::now();
 		if (serial_fd >= 0) 
 		{
 			const int max_data = 10;
@@ -353,6 +366,22 @@ int main (int argc, char** argv)
 				imu_data_msg.linear_acceleration.z = _pIMU_data.dLinear_acceleration_z = data[2] * 9.80665;
 			}
 
+			no_data = SendRecv("q\n", data, max_data);	// Read Quaternion
+			if (no_data >= 4) 
+			{
+				double quat_norm = std::sqrt(data[0]*data[0] + data[1]*data[1] + data[2]*data[2] + data[3]*data[3]);
+				std::cout << "quat_norm: " << quat_norm << std::endl;
+				_pIMU_data.dQuaternion_w  	= data[0]/quat_norm;
+				_pIMU_data.dQuaternion_x	= data[1]/quat_norm;
+				_pIMU_data.dQuaternion_y 	= data[2]/quat_norm;
+				_pIMU_data.dQuaternion_z	= data[3]/quat_norm;
+
+				pose_data_msg.pose.orientation.w = _pIMU_data.dQuaternion_w;
+				pose_data_msg.pose.orientation.x = _pIMU_data.dQuaternion_x;
+				pose_data_msg.pose.orientation.y = _pIMU_data.dQuaternion_y;
+				pose_data_msg.pose.orientation.z = _pIMU_data.dQuaternion_z;
+			}
+
 			no_data = SendRecv("e\n", data, max_data);	// Read Euler angle
 			if (no_data >= 3) 
 			{
@@ -370,14 +399,27 @@ int main (int argc, char** argv)
 			imu_data_msg.orientation.z = orientation[2];
 			imu_data_msg.orientation.w = orientation[3];
 
+
+			// Quaternion data test
+			std::cout << "imu_quat_x - euler_x: " << _pIMU_data.dQuaternion_x - orientation[0] << std::endl;
+			std::cout << "imu_quat_y - euler_y: " << _pIMU_data.dQuaternion_y - orientation[1] << std::endl;
+			std::cout << "imu_quat_z - euler_z: " << _pIMU_data.dQuaternion_z - orientation[2] << std::endl;
+			std::cout << "imu_quat_w - euler_w: " << _pIMU_data.dQuaternion_w - orientation[3] << std::endl;
+
 			// calculate measurement time
             		ros::Time measurement_time = ros::Time::now() + ros::Duration(time_offset_in_seconds);
 
 			imu_data_msg.header.stamp = measurement_time;
-			imu_data_msg.header.frame_id = tf_prefix_ + "/imu_link";  // "imu_link"
+			imu_data_msg.header.frame_id = tf_prefix_ + "imu_link";  // "imu_link"
+			pose_data_msg.header.stamp = imu_data_msg.header.stamp;
+			pose_data_msg.header.frame_id = imu_data_msg.header.frame_id;
+			pose_data_msg.pose.position.x = 0.0;
+			pose_data_msg.pose.position.y = 0.0;
+			pose_data_msg.pose.position.z = 0.0;
 
 			// publish the IMU data
 			imu_data_pub.publish(imu_data_msg);
+			pose_pub.publish(pose_data_msg);
 
 			//Publish tf
 			if(m_bSingle_TF_option)

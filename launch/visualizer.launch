@@ -1,0 +1,5 @@
+<launch>
+    <node pkg="rqt_multiplot" name="state_estimator_multiplot" type="rqt_multiplot" output="screen">
+        <param name="multiplot-config" type="string" value="$(find iahrs_driver)/imu_plot.xml"/>
+    </node>
+</launch>
